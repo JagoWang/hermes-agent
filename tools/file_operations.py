@@ -442,12 +442,22 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             return None
 
     @staticmethod
-    def _is_likely_binary_bytes(sample: bytes) -> bool:
+    def _is_likely_binary_bytes(sample: bytes, file_size: int | None = None) -> bool:
         """Byte-layer binary detection: text iff valid UTF-8, allowing one incomplete
         multibyte sequence at the very end (artifact of the byte-boundary cut).
         NUL bytes or mid-stream invalid UTF-8 stay read-only so a read→edit→write
         round-trip never rewrites undecodable bytes as U+FFFD; a file that
         legitimately CONTAINS U+FFFD is valid UTF-8 and reads as text.
+
+        ``file_size`` is the real file size. A byte-boundary cut is only possible
+        when the sample is a *truncated prefix*, i.e. ``file_size > len(sample)``.
+        Without that distinction a whole SHORT file whose last bytes are invalid
+        UTF-8 falls inside the last-3-bytes window and is waved through as text:
+        a 5-byte latin-1 ``café``, a 4-byte GBK word, or any file ending in a
+        stray 0x80-0xFF byte. ``read_file`` would then return ``caf\\ufffd`` and a
+        read→edit→write round-trip would rewrite the original byte as U+FFFD —
+        the exact mojibake this function exists to prevent. Callers pass the size
+        they already obtained, so no extra I/O; ``None`` keeps the old behaviour.
 
         See #80308.
         """
@@ -460,8 +470,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             return False
         except UnicodeDecodeError as exc:
             # UTF-8 sequences are at most 4 bytes: an error starting in the
-            # last 3 bytes with a clean prefix is a boundary cut, not binary.
-            if exc.start >= len(sample) - 3:
+            # last 3 bytes with a clean prefix is a boundary cut, not binary —
+            # but only if the sample really was cut out of a longer file.
+            truncated = file_size is None or file_size > len(sample)
+            if truncated and exc.start >= len(sample) - 3:
                 try:
                     sample[: exc.start].decode("utf-8")
                     return False
@@ -683,13 +695,19 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         return ReadResult(error=(f"Terminal environment unavailable: could not stat {path} "
                                  "(the sandbox may still be starting or was removed). Retry shortly."))
 
-    def _detect_binary(self, path: str) -> tuple[bool, Optional[bytes]]:
+    def _detect_binary(self, path: str, file_size: int | None = None) -> tuple[bool, Optional[bytes]]:
         """``(is_binary, sample_bytes)`` — byte-layer detection when the transport
-        allows (base64 sample), else the legacy text heuristic (sample is None)."""
+        allows (base64 sample), else the legacy text heuristic (sample is None).
+
+        ``file_size`` (when the caller already has it) lets the byte-layer check
+        tell a truncated sample from a whole short file — see
+        :meth:`_is_likely_binary_bytes`."""
         sample_bytes = self._sample_file_bytes(path)
         if sample_bytes is not None:
             ext_binary = has_binary_extension(path)
-            return ext_binary or self._is_likely_binary_bytes(sample_bytes), sample_bytes
+            return (ext_binary
+                    or self._is_likely_binary_bytes(sample_bytes, file_size=file_size),
+                    sample_bytes)
         sample_output = _strip_terminal_fence_leaks(self._head(path, 1000).stdout)
         return self._is_likely_binary(path, sample_output), None
 
@@ -886,7 +904,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         # text heuristic over a plain sample (one extra round-trip, shells without base64).
         sample_bytes = self._decode_base64_sample(sample_seg) if sample_rc == 0 else None
         if sample_bytes is not None:
-            is_binary = self._is_likely_binary_bytes(sample_bytes)
+            is_binary = self._is_likely_binary_bytes(sample_bytes, file_size=file_size)
         else:
             logger.debug(
                 "read_file: no usable base64 sample for %s (base64 exit %s); "
@@ -968,7 +986,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             with open(full, "rb") as fh:
                 sample = fh.read(1000)
                 ext_binary = has_binary_extension(path)
-                if ext_binary or self._is_likely_binary_bytes(sample):
+                if ext_binary or self._is_likely_binary_bytes(sample, file_size=file_size):
                     return self._read_binary_file(path, offset, limit, file_size, sample)
                 fh.seek(0)
                 while True:
@@ -1095,7 +1113,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             return self._env_unavailable_error(path, status)
         if self._is_image(path):  # never inlined — redirect to the vision tool
             return self._image_redirect_result(file_size)
-        is_binary, sample_bytes = self._detect_binary(path)
+        is_binary, sample_bytes = self._detect_binary(path, file_size=file_size)
         if is_binary:
             return self._read_binary_file(path, offset, limit, file_size, sample_bytes)
 
@@ -1260,7 +1278,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             return self._env_unavailable_error(path, status)
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        is_binary, sample_bytes = self._detect_binary(path)
+        is_binary, sample_bytes = self._detect_binary(path, file_size=file_size)
         if is_binary:
             return ReadResult(is_binary=True, file_size=file_size, error=describe_binary_file(sample_bytes, file_size))
         data, failed = self._read_exact_bytes(path)

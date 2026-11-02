@@ -794,6 +794,55 @@ class TestByteLayerBinaryDetection:
         # Error near the end but the prefix itself is not clean UTF-8.
         assert file_ops._is_likely_binary_bytes(b"\xff\xfe" + b"a" * 10 + b"\xe4") is True
 
+    # --- the last-3-bytes window must not swallow WHOLE short files -------
+    # The boundary-cut allowance exists for `head -c 1000` slicing a multibyte
+    # character. If the sample is the whole file, nothing was cut, so an
+    # invalid byte in the last 3 positions is real damage, not a cut artifact.
+    # Waving it through makes read_file return a U+FFFD for the raw byte and a
+    # read→edit→write round-trip rewrites it — the mojibake this guards.
+
+    def test_short_latin1_file_is_binary_when_size_known(self, file_ops):
+        # 5 bytes, sample IS the whole file: the 0xE9 sits at index 3, inside
+        # the forgiving window, so only the size tells us there was no cut.
+        sample = b"caf\xe9\n"
+        assert file_ops._is_likely_binary_bytes(sample, file_size=5) is True
+
+    def test_short_gbk_file_is_binary_when_size_known(self, file_ops):
+        assert file_ops._is_likely_binary_bytes("中文".encode("gbk"), file_size=4) is True
+
+    def test_stray_trailing_byte_in_whole_file_is_binary(self, file_ops):
+        sample = b"hello world ok text\n\xe9"
+        assert file_ops._is_likely_binary_bytes(sample, file_size=len(sample)) is True
+
+    def test_whole_file_ending_in_ff_fe_is_binary(self, file_ops):
+        sample = b"a" * 898 + b"\xff\xfe"
+        assert file_ops._is_likely_binary_bytes(sample, file_size=900) is True
+
+    # --- ...while a genuinely truncated sample keeps the allowance ---------
+
+    def test_real_truncation_still_tolerated(self, file_ops):
+        # file_size > len(sample) proves the transport cut the sample, so a
+        # trailing partial sequence stays forgiven exactly as before.
+        sample = ("研究正文。" * 250).encode("utf-8")[:1000]
+        assert file_ops._is_likely_binary_bytes(sample, file_size=3750) is False
+
+    def test_cjk_cut_mid_character_with_size_is_text(self, file_ops):
+        sample = (b"a" * 999 + "中".encode())[:1000]
+        assert file_ops._is_likely_binary_bytes(sample, file_size=5000) is False
+
+    def test_full_read_of_cjk_file_is_text(self, file_ops):
+        # Whole file, valid UTF-8, decodes clean — unaffected by the guard.
+        assert file_ops._is_likely_binary_bytes("研究正文。".encode(), file_size=15) is False
+
+    # --- backward compatibility: no size passed ⇒ unchanged behaviour -----
+
+    def test_no_file_size_keeps_legacy_behaviour(self, file_ops):
+        # Callers that omit file_size must behave exactly as before the guard.
+        assert file_ops._is_likely_binary_bytes(b"caf\xe9\n") is False
+
+    def test_nul_with_size_still_binary(self, file_ops):
+        assert file_ops._is_likely_binary_bytes(b"ab\x00cd", file_size=5) is True
+
     # --- transport: _sample_file_bytes ------------------------------------
 
     def test_sample_decodes_base64_transport(self, mock_env):
@@ -847,6 +896,24 @@ class TestByteLayerBinaryDetection:
         mock_env.execute.side_effect = self._dispatch(content)
         ops = ShellFileOperations(mock_env)
         result = ops.read_file("/tmp/a.out")
+        assert result.is_binary is True
+
+    def test_read_file_blocks_short_latin1_file(self, mock_env):
+        # Whole 5-byte file, 0xE9 at index 3. Before the size guard this was
+        # classified as text, so read_file returned 'caf\ufffd\n' and a
+        # read→edit→write round-trip rewrote the original byte as U+FFFD.
+        content = b"caf\xe9\n"
+        mock_env.execute.side_effect = self._dispatch(content)
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file("/tmp/short-latin1.txt")
+        assert result.is_binary is True
+        assert not result.content or "\ufffd" not in result.content
+
+    def test_read_file_blocks_short_gbk_file(self, mock_env):
+        content = "中文".encode("gbk")  # 4 bytes, whole file
+        mock_env.execute.side_effect = self._dispatch(content)
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file("/tmp/short-gbk.txt")
         assert result.is_binary is True
 
 
